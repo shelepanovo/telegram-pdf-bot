@@ -3,7 +3,6 @@ name = "telegram-pdf-bot"
 version = "0.1.0"
 description = ""
 authors = ["Твое имя <email@example.com>"]
-readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.10"
