@@ -1,105 +1,105 @@
 import os
 import logging
-import tempfile
+import pdfkit
 import shutil
 import zipfile
 from telegram import Update, InputFile
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-import pdfkit
-from PyPDF2 import PdfMerger
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-TG_TOKEN = os.getenv("TG_TOKEN")
-WKHTMLTOPDF_PATH = os.getenv("WKHTMLTOPDF_PATH", "./wkhtmltopdf/wkhtmltopdf")
+# Логирование (полезно для Render)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+# Получаем токен из переменных окружения
+TG_TOKEN = os.environ.get("TG_TOKEN")
+
+# Папка для wkhtmltopdf (если локально или в репозитории)
+WKHTMLTOPDF_PATH = './wkhtmltopdf/wkhtmltopdf'
+
+# Проверим, существует ли wkhtmltopdf и сделаем исполняемым
+if os.path.isfile(WKHTMLTOPDF_PATH):
+    os.chmod(WKHTMLTOPDF_PATH, 0o755)
+
+# PDFKit конфигурация
 config = pdfkit.configuration(wkhtmltopdf=WKHTMLTOPDF_PATH)
 
-logging.basicConfig(level=logging.INFO)
+# Папка для загрузки файлов
+UPLOAD_DIR = "uploads"
 
-BASE_TMP_DIR = tempfile.gettempdir()
-
-def get_user_dir(user_id: int):
-    path = os.path.join(BASE_TMP_DIR, f"user_{user_id}")
-    os.makedirs(path, exist_ok=True)
-    return path
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Отправь HTML или PDF файл.\n"
-        "📄 /convert — конвертировать HTML → PDF\n"
-        "📎 /merge — объединить все PDF → ZIP"
-    )
+    await update.message.reply_text("👋 Отправь HTML файлы, затем команду /convert")
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc:
-        return
 
-    user_dir = get_user_dir(update.effective_user.id)
-    file_ext = os.path.splitext(doc.file_name)[-1].lower()
+async def handle_html(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_dir = os.path.join(UPLOAD_DIR, user_id)
+    os.makedirs(user_dir, exist_ok=True)
 
-    file_path = os.path.join(user_dir, doc.file_name)
-    file_obj = await doc.get_file()
-    await file_obj.download_to_drive(custom_path=file_path)
+    file = update.message.document
+    file_path = os.path.join(user_dir, file.file_name)
 
-    if file_ext == ".html":
-        await update.message.reply_text(f"✅ HTML сохранён: {doc.file_name}")
-    elif file_ext == ".pdf":
-        await update.message.reply_text(f"✅ PDF сохранён: {doc.file_name}")
-    else:
-        os.remove(file_path)
-        await update.message.reply_text("⚠️ Поддерживаются только .html и .pdf")
+    await file.get_file().download_to_drive(file_path)
+    await update.message.reply_text(f"✅ Файл получен: {file.file_name}")
+
 
 async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_dir = get_user_dir(update.effective_user.id)
-    html_files = [f for f in os.listdir(user_dir) if f.lower().endswith(".html")]
+    user_id = str(update.effective_user.id)
+    user_dir = os.path.join(UPLOAD_DIR, user_id)
 
-    if not html_files:
-        await update.message.reply_text("❌ Нет HTML файлов для конвертации.")
+    if not os.path.isdir(user_dir):
+        await update.message.reply_text("❌ Нет HTML файлов.")
         return
 
-    zip_path = os.path.join(user_dir, "converted_html.zip")
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        for html_file in html_files:
-            html_path = os.path.join(user_dir, html_file)
-            pdf_name = os.path.splitext(html_file)[0] + ".pdf"
-            pdf_path = os.path.join(user_dir, pdf_name)
+    pdf_dir = os.path.join(user_dir, "pdf")
+    os.makedirs(pdf_dir, exist_ok=True)
+
+    errors = []
+
+    for filename in os.listdir(user_dir):
+        if filename.endswith(".html"):
+            html_path = os.path.join(user_dir, filename)
+            pdf_path = os.path.join(pdf_dir, filename.replace(".html", ".pdf"))
             try:
                 pdfkit.from_file(html_path, pdf_path, configuration=config)
-                zipf.write(pdf_path, arcname=pdf_name)
             except Exception as e:
-                await update.message.reply_text(f"❌ Ошибка в {html_file}: {e}")
+                errors.append(f"{filename}: {str(e)}")
 
-    await update.message.reply_document(InputFile(zip_path, filename="converted_html.zip"))
+    # Создание ZIP
+    zip_path = os.path.join(user_dir, "converted.zip")
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for filename in os.listdir(pdf_dir):
+            file_path = os.path.join(pdf_dir, filename)
+            zipf.write(file_path, arcname=filename)
+
+    # Отправка архива
+    await update.message.reply_document(InputFile(zip_path))
+
+    if errors:
+        error_text = "\n".join(errors)
+        await update.message.reply_text(f"⚠️ Ошибки:\n{error_text}")
+
+    # Очистка
     shutil.rmtree(user_dir)
 
-async def merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_dir = get_user_dir(update.effective_user.id)
-    pdf_files = sorted(f for f in os.listdir(user_dir) if f.lower().endswith(".pdf"))
-
-    if not pdf_files:
-        await update.message.reply_text("❌ Нет PDF файлов для объединения.")
-        return
-
-    merged_path = os.path.join(user_dir, "merged.pdf")
-    merger = PdfMerger()
-    for pdf in pdf_files:
-        merger.append(os.path.join(user_dir, pdf))
-    merger.write(merged_path)
-    merger.close()
-
-    zip_path = os.path.join(user_dir, "merged_pdf.zip")
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.write(merged_path, arcname="merged.pdf")
-
-    await update.message.reply_document(InputFile(zip_path, filename="merged_pdf.zip"))
-    shutil.rmtree(user_dir)
 
 def main():
     app = ApplicationBuilder().token(TG_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("convert", convert))
-    app.add_handler(CommandHandler("merge", merge))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("html"), handle_html))
+
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
